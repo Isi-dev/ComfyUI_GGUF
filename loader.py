@@ -9,7 +9,8 @@ import os
 from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
 
-IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image"}
+IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2",
+                 "qwen_image", "ideogram4", "krea2", "minimax", "qwen_image21"}
 TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
@@ -138,8 +139,9 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             torch_tensor = torch_tensor.view(*shape)
         state_dict[sd_key] = GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape)
 
-        # 1D tensors shouldn't be quantized, this is a fix for BF16
-        if len(shape) <= 1 and tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
+        # 1D tensors shouldn't be quantized, this is a fix for BF16 and for
+        # sd.cpp builds that quantize 1D norm weights
+        if len(shape) <= 1 and is_quantized(state_dict[sd_key]):
             state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=torch.float32)
 
         # keep track of loaded tensor types
@@ -219,6 +221,22 @@ CLIP_VISION_SD_MAP = {
     "ln2.": "norm2.",
 }
 
+QWEN3_VISION_SD_MAP = {
+    "mm.0.": "visual.merger.linear_fc1.",
+    "mm.2.": "visual.merger.linear_fc2.",
+    "v.post_ln.": "visual.merger.norm.",
+    "v.position_embd.": "visual.pos_embed.",
+    "v.patch_embd": "visual.patch_embed.proj",
+    "v.blk.": "visual.blocks.",
+    "ffn_up": "mlp.linear_fc1",
+    "ffn_down": "mlp.linear_fc2",
+    "attn_qkv.": "attn.qkv.",
+    "attn_out.": "attn.proj.",
+    "ln1.": "norm1.",
+    "ln2.": "norm2.",
+}
+
+
 def sd_map_replace(raw_sd, key_map):
     sd = {}
     for k,v in raw_sd.items():
@@ -297,7 +315,7 @@ def gguf_mmproj_loader(path):
 
     logging.info(f"Using mmproj '{target[0]}' for text encoder '{tenc_fname}'.")
     target = os.path.join(root, target[0])
-    vsd, _ = gguf_sd_loader(target, is_text_model=True)
+    vsd, extra = gguf_sd_loader(target, is_text_model=True)
 
     # concat 4D to 5D
     if "v.patch_embd.weight.1" in vsd:
@@ -306,7 +324,14 @@ def gguf_mmproj_loader(path):
         vsd["v.patch_embd.weight"] = torch.stack([w1, w2], dim=2)
 
     # run main replacement
-    vsd = sd_map_replace(vsd, CLIP_VISION_SD_MAP)
+    key_map = CLIP_VISION_SD_MAP
+    if extra["metadata"].get("clip.projector_type") == "qwen3vl_merger":
+        key_map = QWEN3_VISION_SD_MAP.copy()
+        deepstack_layers = sorted({int(k.split(".")[2]) for k in vsd if k.startswith("v.deepstack.")})
+        for i, layer in enumerate(deepstack_layers):
+            for src, dst in (("fc1", "linear_fc1"), ("fc2", "linear_fc2"), ("norm", "norm")):
+                key_map[f"v.deepstack.{layer}.{src}."] = f"visual.deepstack_merger_list.{i}.{dst}."
+    vsd = sd_map_replace(vsd, key_map)
 
     # handle split Q/K/V
     if "visual.blocks.0.attn_q.weight" in vsd:
@@ -498,8 +523,12 @@ def gguf_clip_loader(path):
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
         if arch == "llama":
             sd = llama_permute(sd, 32, 8) # L3 / Mistral
-        if arch == "qwen2vl":
+        if arch in {"qwen2vl", "qwen3vl"}:
             vsd = gguf_mmproj_loader(path)
+            if arch == "qwen3vl":
+                if not vsd:
+                    raise ValueError(f"Qwen3-VL requires a matching mmproj GGUF alongside the text encoder: {path}")
+                vsd = {f"model.{k}": v for k, v in vsd.items()}
             sd.update(vsd)
     else:
         pass
